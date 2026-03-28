@@ -1,0 +1,41 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime/data artifacts
+output/*
+!output/.gitkeep
+input_videos/*
+!input_videos/.gitkeep
+weights/*
+!weights/.gitkeep
+
+# Packaging artifacts
+*.tar
+*.tar.gz
+*.zip
+
+# Local dataset/meta files
+trainval.json
+test.json
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local env files
+.env
+.env.*
+!.env.runtime.template

@@ -1,0 +1,46 @@
+ARG BASE_IMAGE="pytorch/pytorch:1.9.0-cuda11.1-cudnn8-devel"
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    FORCE_CUDA=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN rm -f /etc/apt/sources.list.d/cuda.list \
+    && rm -f /etc/apt/sources.list.d/nvidia-ml.list \
+    && apt-key del 7fa2af80 || true \
+    && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub \
+    && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1804/x86_64/7fa2af80.pub
+
+RUN set -eux; \
+    sed -i '/bionic-backports/d' /etc/apt/sources.list; \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    printf 'Acquire::Retries "8";\nAcquire::http::Timeout "60";\nAcquire::http::Pipeline-Depth "0";\n' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends --fix-missing ffmpeg libsm6 libxext6 git ninja-build libglib2.0-0 libxrender-dev \
+    || (apt-get clean \
+        && rm -rf /var/lib/apt/lists/* \
+        && sed -i 's|http://mirrors.aliyun.com/ubuntu|http://mirrors.ustc.edu.cn/ubuntu|g' /etc/apt/sources.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends --fix-missing ffmpeg libsm6 libxext6 git ninja-build libglib2.0-0 libxrender-dev); \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/mmyolo
+COPY . /workspace/mmyolo
+
+RUN pip install openmim \
+    && mim install "mmengine>=0.6.0" "mmcv>=2.0.0rc4,<2.1.0" "mmdet>=3.0.0,<4.0.0" \
+    && pip install -r requirements/runtime.txt \
+    && pip install pillow \
+    && pip install -e .
+
+ENV PYTHONPATH="/workspace/mmyolo:/workspace/mmyolo/projects/piping/src:${PYTHONPATH}" \
+    TCP_HOST=0.0.0.0 \
+    TCP_PORT=9000 \
+    OUTPUT_DIR=/workspace/mmyolo/output/tcp_results
+
+EXPOSE 9000
+
+CMD ["python", "tools/piping_infer/tcp_infer_server.py", "--host", "0.0.0.0", "--port", "9000"]

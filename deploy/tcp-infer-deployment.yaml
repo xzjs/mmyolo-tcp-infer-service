@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mmyolo-tcp-infer-config
+data:
+  TCP_HOST: "0.0.0.0"
+  TCP_PORT: "9000"
+  MODEL_CONFIG: "/workspace/mmyolo/projects/piping/configs/yolov8_n_fast_8xb16-500e_defect_lower_lr_ag.py"
+  MODEL_CHECKPOINT: "/workspace/mmyolo/weights/best_coco_破裂_precision_epoch_25.pth"
+  MODEL_DEVICE: "cuda:0"
+  SCORE_THR: "0.3"
+  OUTPUT_DIR: "/workspace/mmyolo/output/tcp_results"
+  INFER_STRIDE: "3"
+  MAX_FRAMES: "-1"
+  PROGRESS_EVERY_FRAMES: "30"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmyolo-tcp-infer
+  labels:
+    app: mmyolo-tcp-infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mmyolo-tcp-infer
+  template:
+    metadata:
+      labels:
+        app: mmyolo-tcp-infer
+    spec:
+      containers:
+        - name: mmyolo-tcp-infer
+          image: your-registry/mmyolo-tcp-infer:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9000
+              name: tcp-infer
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: mmyolo-tcp-infer-config
+          command: ["python", "tools/piping_infer/tcp_infer_server.py"]
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "9000"
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: weights-volume
+              mountPath: /workspace/mmyolo/weights
+            - name: output-volume
+              mountPath: /workspace/mmyolo/output
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+      volumes:
+        - name: weights-volume
+          persistentVolumeClaim:
+            claimName: mmyolo-weights-pvc
+        - name: output-volume
+          persistentVolumeClaim:
+            claimName: mmyolo-output-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmyolo-tcp-infer
+  labels:
+    app: mmyolo-tcp-infer
+spec:
+  selector:
+    app: mmyolo-tcp-infer
+  ports:
+    - name: tcp-infer
+      protocol: TCP
+      port: 9000
+      targetPort: 9000
+  type: ClusterIP
