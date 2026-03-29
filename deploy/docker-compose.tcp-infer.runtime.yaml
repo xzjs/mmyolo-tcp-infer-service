@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   mmyolo-tcp-infer:
-    image: registry.cn-hangzhou.aliyuncs.com/xzjs/mmyolo-tcp-infer:1.0
+    image: registry.cn-hangzhou.aliyuncs.com/xzjs/mmyolo-tcp-infer:1.4
     container_name: mmyolo-tcp-infer
     restart: unless-stopped
     gpus: all
@@ -25,6 +25,4 @@ services:
       - ${OUTPUT_DIR_HOST:-D:/piping/output}:/workspace/mmyolo/output
       - ${LOCAL_INPUT_DIR:-D:/piping/input}:/data/local_input
     command: >
-      python tools/piping_infer/tcp_infer_server.py
-      --host 0.0.0.0
-      --port 9000
+      python tools/piping_infer/tcp_infer_server.py --host 0.0.0.0 --port 9000

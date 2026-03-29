@@ -606,11 +606,19 @@ def parse_grading_result(pred_level: List[Tuple[int, int]], class_names: List[st
 
 def get_pil_font(size: int) -> ImageFont.FreeTypeFont:
     """尽量加载中文字体，失败则退回默认字体。"""
-    try:
-        if os.path.isfile(FONT_PATH):
-            return ImageFont.truetype(FONT_PATH, size)
-    except Exception:
-        pass
+    candidate_fonts = [
+        FONT_PATH,
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+        '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ]
+    for font_path in candidate_fonts:
+        try:
+            if os.path.isfile(font_path):
+                return ImageFont.truetype(font_path, size)
+        except Exception:
+            continue
     return ImageFont.load_default()
 
 
@@ -624,17 +632,39 @@ def draw_text_pil(
     bg_color=(0, 255, 0),
 ) -> np.ndarray:
     """用 PIL 在 BGR 图像上绘制中文文本。"""
+
+    def _safe_text(raw_text: str) -> str:
+        """默认字体不支持中文时，降级为可编码文本，避免流程崩溃。"""
+        try:
+            raw_text.encode('latin-1')
+            return raw_text
+        except UnicodeEncodeError:
+            return raw_text.encode('latin-1', errors='replace').decode('latin-1')
+
     img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     img_pil = Image.fromarray(img_rgb)
     draw = ImageDraw.Draw(img_pil)
     font = get_pil_font(font_size)
+    text_to_draw = text
 
-    bbox = draw.textbbox((x, y), text, font=font)
-    x1, y1, x2, y2 = bbox
+    # 兼容不同 Pillow 版本：优先 textbbox，不支持则退回 textsize/getsize。
+    try:
+        x1, y1, x2, y2 = draw.textbbox((x, y), text_to_draw, font=font)
+    except Exception:
+        text_to_draw = _safe_text(text_to_draw)
+        try:
+            text_w, text_h = draw.textsize(text_to_draw, font=font)
+        except Exception:
+            text_w, text_h = font.getsize(text_to_draw)
+        x1, y1 = x, y
+        x2, y2 = x + text_w, y + text_h
 
     pad = 3
     draw.rectangle([x1 - pad, y1 - pad, x2 + pad, y2 + pad], fill=bg_color)
-    draw.text((x, y), text, font=font, fill=text_color)
+    try:
+        draw.text((x, y), text_to_draw, font=font, fill=text_color)
+    except Exception:
+        draw.text((x, y), _safe_text(text_to_draw), font=font, fill=text_color)
 
     out_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     return out_bgr

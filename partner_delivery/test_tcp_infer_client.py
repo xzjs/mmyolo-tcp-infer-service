@@ -24,7 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='TCP infer service test client')
     parser.add_argument('--host', default='127.0.0.1', help='server host')
     parser.add_argument('--port', type=int, default=9000, help='server port')
-    parser.add_argument('--file-path', required=True, help='file path to infer (can be Windows path)')
+    parser.add_argument(
+        '--file-path',
+        default=r'D:\code\python\piping\input\test.mp4',
+        help='file path to infer (can be Windows path)',
+    )
     parser.add_argument('--task-id', default='', help='task id, auto-generated when empty')
     parser.add_argument('--config', default='', help='optional config path')
     parser.add_argument('--checkpoint', default='', help='optional checkpoint path')
