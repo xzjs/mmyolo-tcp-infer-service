@@ -7,7 +7,7 @@ export PYTHONPATH="$PWD:$PWD/projects/piping/src:${PYTHONPATH}"
 HOST="${TCP_HOST:-0.0.0.0}"
 PORT="${TCP_PORT:-9000}"
 
-DEFAULT_CONFIG="${MODEL_CONFIG:-./projects/piping/configs/yolov8_n_fast_8xb16-500e_defect_lower_lr_ag.py}"
+DEFAULT_CONFIG="${MODEL_CONFIG:-./projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py}"
 DEFAULT_CHECKPOINT="${MODEL_CHECKPOINT:-./weights/best_coco_破裂_precision_epoch_25.pth}"
 DEFAULT_DEVICE="${MODEL_DEVICE:-cuda:0}"
 DEFAULT_SCORE_THR="${SCORE_THR:-0.3}"

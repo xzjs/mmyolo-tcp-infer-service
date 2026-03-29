@@ -63,7 +63,7 @@ bash run_tcp_infer_server.sh
 {
   "task_id": "task-001",
   "file_path": "C:\\Users\\yourname\\data\\piping_inputs\\demo.jpg",
-  "config": "/workspace/mmyolo/projects/piping/configs/yolov8_n_fast_8xb16-500e_defect_lower_lr_ag.py",
+  "config": "/workspace/mmyolo/projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py",
   "checkpoint": "/workspace/mmyolo/weights/best_coco_破裂_precision_epoch_25.pth",
   "device": "cuda:0",
   "score_thr": 0.3,

@@ -11,7 +11,7 @@ services:
     environment:
       TCP_HOST: "0.0.0.0"
       TCP_PORT: "9000"
-      MODEL_CONFIG: "/workspace/mmyolo/projects/piping/configs/yolov8_n_fast_8xb16-500e_defect_lower_lr_ag.py"
+      MODEL_CONFIG: "/workspace/mmyolo/projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py"
       MODEL_CHECKPOINT: "/workspace/mmyolo/weights/best_coco_破裂_precision_epoch_25.pth"
       MODEL_DEVICE: "cuda:0"
       SCORE_THR: "0.3"

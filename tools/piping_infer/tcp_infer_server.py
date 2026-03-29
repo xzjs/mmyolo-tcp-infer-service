@@ -17,6 +17,7 @@ import json
 import os
 import re
 import socketserver
+import subprocess
 import sys
 import threading
 import traceback
@@ -26,7 +27,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mmcv
-from mmcv.transforms import Compose
 from mmdet.apis import inference_detector, init_detector
 from mmengine.utils import mkdir_or_exist
 
@@ -372,7 +372,9 @@ class InferenceService:
         self,
         task_id: str,
         input_path: Path,
-        model: Any,
+        config_path: Path,
+        checkpoint_path: Path,
+        device: str,
         score_thr: float,
         out_dir: Path,
         infer_stride: int,
@@ -383,68 +385,137 @@ class InferenceService:
     ) -> Dict[str, Any]:
         mkdir_or_exist(str(out_dir))
         output_jsonl = out_dir / f'{task_id}_video.jsonl'
+        output_video = out_dir / f'{task_id}_video.mp4'
+        script_path = REPO_ROOT / 'tools' / 'piping_infer' / 'video_infer_piping.py'
+        if not script_path.exists():
+            raise FileNotFoundError(f'video infer script not found: {script_path}')
 
-        progress_cb(10, 'load_video', 'opening video')
-        video_reader = mmcv.VideoReader(str(input_path))
-        if len(video_reader) == 0:
-            raise RuntimeError(f'Failed to read video content: {input_path}')
-        total_frames = int(len(video_reader))
-        src_fps = float(video_reader.fps)
+        progress_cb(8, 'video_prepare', 'using video_infer_piping.py logic')
 
-        # Ensure ndarray input for video frame inference.
-        model.cfg.test_dataloader.dataset.pipeline[0].type = 'mmdet.LoadImageFromNDArray'
-        test_pipeline = Compose(model.cfg.test_dataloader.dataset.pipeline)
+        total_frames = -1
+        expected_total = -1
+        try:
+            reader = mmcv.VideoReader(str(input_path))
+            if len(reader) > 0:
+                total_frames = int(len(reader))
+                expected_total = min(total_frames, max_frames) if max_frames > 0 else total_frames
+        except Exception:
+            pass
 
-        class_names = list(getattr(model, 'dataset_meta', {}).get('classes', []))
-        records: List[Dict[str, Any]] = []
+        cmd = [
+            sys.executable,
+            str(script_path),
+            str(input_path),
+            str(config_path),
+            str(checkpoint_path),
+            '--device',
+            device,
+            '--score-thr',
+            str(score_thr),
+            '--out-video',
+            str(output_video),
+            '--out-jsonl',
+            str(output_jsonl),
+            '--print-every',
+            str(max(progress_every_frames, 1)),
+        ]
+        if max_frames > 0:
+            cmd.extend(['--max-frames', str(max_frames)])
 
-        processed_frames = 0
-        inferenced_frames = 0
-        expected_total = min(total_frames, max_frames) if max_frames > 0 else total_frames
+        # Keep the same import environment as run_video_infer.sh.
+        env = os.environ.copy()
+        py_path_items = [str(REPO_ROOT), str(PIPING_SRC)]
+        old_py_path = env.get('PYTHONPATH', '').strip()
+        if old_py_path:
+            py_path_items.append(old_py_path)
+        env['PYTHONPATH'] = os.pathsep.join(py_path_items)
 
-        with open(output_jsonl, 'w', encoding='utf-8') as f_jsonl:
-            for frame_idx, frame in enumerate(video_reader):
-                if frame is None:
-                    continue
+        progress_cb(10, 'video_script_start', 'starting video_infer_piping.py')
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            env=env,
+            bufsize=1,
+        )
 
-                if max_frames > 0 and processed_frames >= max_frames:
-                    break
+        processed_frames = -1
+        inferenced_frames = -1
+        tail_logs: List[str] = []
+        if proc.stdout is None:
+            raise RuntimeError('failed to read video script stdout')
 
-                processed_frames += 1
-                if frame_idx % max(infer_stride, 1) != 0:
-                    if processed_frames % max(progress_every_frames, 1) == 0:
-                        progress = 10 + int(80 * processed_frames / max(expected_total, 1))
-                        progress_cb(min(progress, 90), 'infer_video', f'processed frame {processed_frames}/{expected_total}')
-                    continue
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            tail_logs.append(line)
+            if len(tail_logs) > 80:
+                tail_logs = tail_logs[-80:]
 
-                result = self._infer(model, frame, test_pipeline=test_pipeline)
-                detections = parse_detection_result(result, score_thr, class_names)
-                grading = parse_grading_result(get_pred_level(result), class_names)
-                record = {
-                    'frame_index': frame_idx,
-                    'time_sec': round(frame_idx / max(src_fps, 1e-6), 6),
-                    'detections': detections,
-                    'pred_level': grading,
-                }
-                inferenced_frames += 1
-                f_jsonl.write(json.dumps(record, ensure_ascii=False) + '\n')
-                if return_records:
-                    records.append(record)
-
-                if processed_frames % max(progress_every_frames, 1) == 0:
+            info_match = re.search(r'processed=(\d+)', line)
+            if info_match:
+                processed_frames = int(info_match.group(1))
+                if expected_total > 0:
                     progress = 10 + int(80 * processed_frames / max(expected_total, 1))
-                    progress_cb(min(progress, 90), 'infer_video', f'processed frame {processed_frames}/{expected_total}')
+                    progress = min(progress, 90)
+                else:
+                    progress = 50
+                progress_cb(progress, 'infer_video', line)
+                continue
 
-        progress_cb(95, 'finalizing', 'video inference finished, preparing response')
+            done_frames_match = re.search(r'^\[DONE\]\s+frames\s*=\s*(\d+)', line)
+            if done_frames_match:
+                processed_frames = int(done_frames_match.group(1))
+                progress_cb(95, 'video_done', line)
+                continue
+
+            progress_cb(15, 'video_log', line)
+
+        return_code = proc.wait()
+        if return_code != 0:
+            joined = '\n'.join(tail_logs[-20:])
+            raise RuntimeError(
+                f'video_infer_piping.py failed with code {return_code}\n'
+                f'last logs:\n{joined}'
+            )
+
+        records: List[Dict[str, Any]] = []
+        if output_jsonl.exists():
+            with open(output_jsonl, 'r', encoding='utf-8') as f_jsonl:
+                for line in f_jsonl:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if return_records:
+                        try:
+                            records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+
+            # jsonl contains inferenced frames only.
+            try:
+                with open(output_jsonl, 'r', encoding='utf-8') as f_jsonl:
+                    inferenced_frames = sum(1 for _ in f_jsonl)
+            except Exception:
+                inferenced_frames = -1
+
+        progress_cb(98, 'finalizing', 'video inference finished, preparing response')
         return {
             'kind': 'video',
             'input': str(input_path),
             'total_frames': total_frames,
             'processed_frames': processed_frames,
             'inferenced_frames': inferenced_frames,
-            'infer_stride': max(infer_stride, 1),
+            'requested_infer_stride': max(infer_stride, 1),
+            'output_video': str(output_video),
             'output_jsonl': str(output_jsonl),
             'records': records,
+            'engine': 'video_infer_piping.py',
         }
 
     def process_request(
@@ -500,13 +571,13 @@ class InferenceService:
         kind = self._detect_kind(input_path)
         progress_cb(3, 'input_ready', f'input kind: {kind}')
 
-        model = self._get_model(config_path, checkpoint_path, device, progress_cb)
-
         if kind == 'video':
             result = self._process_video(
                 task_id=task_id,
                 input_path=input_path,
-                model=model,
+                config_path=config_path,
+                checkpoint_path=checkpoint_path,
+                device=device,
                 score_thr=score_thr,
                 out_dir=out_dir,
                 infer_stride=infer_stride,
@@ -516,6 +587,7 @@ class InferenceService:
                 progress_cb=progress_cb,
             )
         else:
+            model = self._get_model(config_path, checkpoint_path, device, progress_cb)
             result = self._process_images(
                 task_id=task_id,
                 input_path=input_path,
@@ -611,7 +683,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--port', type=int, default=int(os.getenv('TCP_PORT', '9000')), help='TCP bind port')
     parser.add_argument(
         '--default-config',
-        default=os.getenv('MODEL_CONFIG', str(REPO_ROOT / 'projects/piping/configs/yolov8_n_fast_8xb16-500e_defect_lower_lr_ag.py')),
+        default=os.getenv('MODEL_CONFIG', str(REPO_ROOT / 'projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py')),
         help='default config path if not provided in request',
     )
     parser.add_argument(
