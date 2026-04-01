@@ -3,13 +3,19 @@
 
 """TCP inference server for piping detection.
 
-Protocol:
-1. Client sends one JSON line as request.
-2. Server streams JSON lines back:
+协议：
+1. 客户端发送一行 JSON；
+2. 服务端连续返回 JSON 行：
    - {"type":"ack", ...}
    - {"type":"progress", ...}
    - {"type":"result", "status":"ok", ...}
    - {"type":"error", "status":"error", ...}
+
+本版相对仓库原版新增：
+1. 真正把 infer_stride / vis_stride / write_stride 透传给视频脚本；
+2. 支持缺陷级去重参数透传；
+3. 支持返回 defects.json、frame_index.json、缺陷图片目录；
+4. 文件内保留中文注释，便于交付和后续维护。
 """
 
 import argparse
@@ -42,19 +48,12 @@ if str(PIPING_SRC) not in sys.path:
 from mmyolo.registry import VISUALIZERS
 from mmyolo.utils.misc import get_file_list
 
-
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
 VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.m4v', '.ts'}
 WINDOWS_PATH_RE = re.compile(r'^[a-zA-Z]:[\\/]')
 
 
 def parse_path_mappings(raw_value: str) -> List[Tuple[str, str]]:
-    """Parse windows->container path mappings.
-
-    Supports:
-    1) "C:\\data=/mnt/data;D:\\videos=/mnt/videos"
-    2) JSON object string: {"C:\\data":"/mnt/data"}
-    """
     value = (raw_value or '').strip()
     if not value:
         return []
@@ -138,7 +137,6 @@ def parse_grading_result(pred_level: List[Tuple[int, int]], class_names: List[st
 
 
 def normalize_jsonable(data: Any) -> Any:
-    """Make sure response payload is JSON serializable."""
     if isinstance(data, (str, int, float, bool)) or data is None:
         return data
     if isinstance(data, Path):
@@ -159,6 +157,23 @@ class InferenceService:
         default_score_thr: float,
         default_out_dir: str,
         default_infer_stride: int,
+        default_vis_stride: int,
+        default_write_stride: int,
+        default_resize_width: int,
+        default_resize_height: int,
+        default_vis_score_thr: float,
+        default_vis_topk: int,
+        default_match_iou_thr: float,
+        default_match_center_dist_ratio: float,
+        default_max_frame_gap: int,
+        default_post_merge_gap_frames: int,
+        default_post_merge_iou_thr: float,
+        default_chain_gap_frames: int,
+        default_chain_iou_thr: float,
+        default_chain_center_dist_ratio: float,
+        default_chain_max_keep: int,
+        default_min_hits: int,
+        default_single_hit_high_score: float,
         default_max_frames: int,
         default_progress_every: int,
         path_mappings: Optional[List[Tuple[str, str]]] = None,
@@ -169,12 +184,28 @@ class InferenceService:
         self.default_score_thr = default_score_thr
         self.default_out_dir = default_out_dir
         self.default_infer_stride = default_infer_stride
+        self.default_vis_stride = default_vis_stride
+        self.default_write_stride = default_write_stride
+        self.default_resize_width = default_resize_width
+        self.default_resize_height = default_resize_height
+        self.default_vis_score_thr = default_vis_score_thr
+        self.default_vis_topk = default_vis_topk
+        self.default_match_iou_thr = default_match_iou_thr
+        self.default_match_center_dist_ratio = default_match_center_dist_ratio
+        self.default_max_frame_gap = default_max_frame_gap
+        self.default_post_merge_gap_frames = default_post_merge_gap_frames
+        self.default_post_merge_iou_thr = default_post_merge_iou_thr
+        self.default_chain_gap_frames = default_chain_gap_frames
+        self.default_chain_iou_thr = default_chain_iou_thr
+        self.default_chain_center_dist_ratio = default_chain_center_dist_ratio
+        self.default_chain_max_keep = default_chain_max_keep
+        self.default_min_hits = default_min_hits
+        self.default_single_hit_high_score = default_single_hit_high_score
         self.default_max_frames = default_max_frames
         self.default_progress_every = default_progress_every
 
         self._model_cache: Dict[Tuple[str, str, str], Any] = {}
         self._model_lock = threading.Lock()
-        # Use a lock for runtime inference to reduce multi-thread GPU conflicts.
         self._infer_lock = threading.Lock()
         self._path_mappings = self._normalize_path_mappings(path_mappings or [])
 
@@ -216,7 +247,6 @@ class InferenceService:
                     mapped = mapped / PurePosixPath(rel.replace('\\', '/'))
                 return Path(str(mapped)).resolve()
 
-        # Fallback for Docker Desktop-like mount locations.
         drive = client_path[0].lower()
         rel_rest = client_path[2:].lstrip('\\').replace('\\', '/')
         candidates = [
@@ -228,13 +258,7 @@ class InferenceService:
                 return candidate.resolve()
         return None
 
-    def _resolve_request_path(
-        self,
-        path_str: str,
-        base_dir: Optional[Path],
-        field_name: str,
-        must_exist: bool,
-    ) -> Path:
+    def _resolve_request_path(self, path_str: str, base_dir: Optional[Path], field_name: str, must_exist: bool) -> Path:
         raw = str(path_str).strip()
         if not raw:
             raise ValueError(f'`{field_name}` is empty')
@@ -254,49 +278,42 @@ class InferenceService:
             raise FileNotFoundError(f'{field_name} path not found: {path}')
         return path
 
-    def _get_model(
-        self,
-        config_path: Path,
-        checkpoint_path: Path,
-        device: str,
-        progress_cb: Callable[[int, str, str], None],
-    ) -> Any:
-        key = (str(config_path), str(checkpoint_path), device)
+    def _get_model(self, config_path: Path, checkpoint_path: Path, device: str,
+                   progress_cb: Callable[[int, str, str], None]) -> Any:
+        cache_key = (str(config_path), str(checkpoint_path), device)
         with self._model_lock:
-            if key in self._model_cache:
-                progress_cb(8, 'model_ready', 'reuse cached model')
-                return self._model_cache[key]
+            if cache_key in self._model_cache:
+                progress_cb(5, 'load_model', 'using cached model')
+                return self._model_cache[cache_key]
 
-            progress_cb(5, 'model_loading', 'loading model and weights')
+            progress_cb(5, 'load_model', 'initializing detector')
             model = init_detector(str(config_path), str(checkpoint_path), device=device)
-            self._model_cache[key] = model
-            progress_cb(8, 'model_ready', 'model loaded')
+            self._model_cache[cache_key] = model
             return model
 
-    def _infer(self, model: Any, input_data: Any, test_pipeline: Any = None) -> Any:
+    def _infer(self, model: Any, file_path: str) -> Any:
         with self._infer_lock:
-            if test_pipeline is None:
-                return inference_detector(model, input_data)
-            return inference_detector(model, input_data, test_pipeline=test_pipeline)
+            return inference_detector(model, file_path)
 
-    def _detect_kind(self, file_path: Path) -> str:
-        if file_path.is_dir():
-            return 'image_dir'
-        suffix = file_path.suffix.lower()
-        if suffix in IMAGE_EXTS:
+    def _detect_kind(self, input_path: Path) -> str:
+        if input_path.is_dir():
             return 'image'
+        suffix = input_path.suffix.lower()
         if suffix in VIDEO_EXTS:
             return 'video'
-        raise ValueError(f'Unsupported file extension: {suffix}')
+        if suffix in IMAGE_EXTS:
+            return 'image'
+        raise ValueError(f'unsupported input type: {input_path}')
 
-    def _image_out_name(self, input_root: Path, file_path: str) -> str:
-        file_path_obj = Path(file_path)
-        if input_root.is_dir():
+    def _image_out_name(self, input_path: Path, file_path: str) -> str:
+        path_obj = Path(file_path)
+        if input_path.is_dir():
             try:
-                return file_path_obj.resolve().relative_to(input_root).as_posix().replace('/', '_')
+                rel = path_obj.resolve().relative_to(input_path.resolve())
+                return str(rel).replace(os.sep, '_')
             except Exception:
-                return file_path_obj.name
-        return file_path_obj.name
+                return path_obj.name
+        return path_obj.name
 
     def _process_images(
         self,
@@ -335,11 +352,7 @@ class InferenceService:
                 result = self._infer(model, file)
                 detections = parse_detection_result(result, score_thr, class_names)
                 grading = parse_grading_result(get_pred_level(result), class_names)
-                record = {
-                    'image': file,
-                    'detections': detections,
-                    'pred_level': grading,
-                }
+                record = {'image': file, 'detections': detections, 'pred_level': grading}
                 records.append(record)
                 f_jsonl.write(json.dumps(record, ensure_ascii=False) + '\n')
 
@@ -378,6 +391,23 @@ class InferenceService:
         score_thr: float,
         out_dir: Path,
         infer_stride: int,
+        vis_stride: int,
+        write_stride: int,
+        resize_width: int,
+        resize_height: int,
+        vis_score_thr: float,
+        vis_topk: int,
+        match_iou_thr: float,
+        match_center_dist_ratio: float,
+        max_frame_gap: int,
+        post_merge_gap_frames: int,
+        post_merge_iou_thr: float,
+        chain_gap_frames: int,
+        chain_iou_thr: float,
+        chain_center_dist_ratio: float,
+        chain_max_keep: int,
+        min_hits: int,
+        single_hit_high_score: float,
         max_frames: int,
         progress_every_frames: int,
         return_records: bool,
@@ -386,6 +416,11 @@ class InferenceService:
         mkdir_or_exist(str(out_dir))
         output_jsonl = out_dir / f'{task_id}_video.jsonl'
         output_video = out_dir / f'{task_id}_video.mp4'
+        output_defects_json = out_dir / f'{task_id}_video_defects.json'
+        output_frame_index_json = out_dir / f'{task_id}_video_frame_index.json'
+        output_defect_frames_dir = out_dir / f'{task_id}_video_defect_images'
+        output_defect_crops_dir = out_dir / f'{task_id}_video_defect_crops_unused'
+
         script_path = REPO_ROOT / 'tools' / 'piping_infer' / 'video_infer_piping.py'
         if not script_path.exists():
             raise FileNotFoundError(f'video infer script not found: {script_path}')
@@ -408,21 +443,37 @@ class InferenceService:
             str(input_path),
             str(config_path),
             str(checkpoint_path),
-            '--device',
-            device,
-            '--score-thr',
-            str(score_thr),
-            '--out-video',
-            str(output_video),
-            '--out-jsonl',
-            str(output_jsonl),
-            '--print-every',
-            str(max(progress_every_frames, 1)),
+            '--device', device,
+            '--score-thr', str(score_thr),
+            '--out-video', str(output_video),
+            '--out-jsonl', str(output_jsonl),
+            '--out-defects-json', str(output_defects_json),
+            '--out-frame-index-json', str(output_frame_index_json),
+            '--save-defect-frames-dir', str(output_defect_frames_dir),
+            '--save-defect-crops-dir', str(output_defect_crops_dir),
+            '--infer-stride', str(max(infer_stride, 1)),
+            '--vis-stride', str(max(vis_stride, 1)),
+            '--write-stride', str(max(write_stride, 1)),
+            '--resize-width', str(max(resize_width, 32)),
+            '--resize-height', str(max(resize_height, 32)),
+            '--vis-score-thr', str(vis_score_thr),
+            '--vis-topk', str(max(vis_topk, 1)),
+            '--match-iou-thr', str(match_iou_thr),
+            '--match-center-dist-ratio', str(match_center_dist_ratio),
+            '--max-frame-gap', str(max(max_frame_gap, 1)),
+            '--post-merge-gap-frames', str(max(post_merge_gap_frames, 0)),
+            '--post-merge-iou-thr', str(post_merge_iou_thr),
+            '--chain-gap-frames', str(max(chain_gap_frames, 0)),
+            '--chain-iou-thr', str(chain_iou_thr),
+            '--chain-center-dist-ratio', str(chain_center_dist_ratio),
+            '--chain-max-keep', str(max(chain_max_keep, 1)),
+            '--min-hits', str(max(min_hits, 1)),
+            '--single-hit-high-score', str(single_hit_high_score),
+            '--print-every', str(max(progress_every_frames, 1)),
         ]
         if max_frames > 0:
             cmd.extend(['--max-frames', str(max_frames)])
 
-        # Keep the same import environment as run_video_infer.sh.
         env = os.environ.copy()
         py_path_items = [str(REPO_ROOT), str(PIPING_SRC)]
         old_py_path = env.get('PYTHONPATH', '').strip()
@@ -445,6 +496,7 @@ class InferenceService:
 
         processed_frames = -1
         inferenced_frames = -1
+        dedup_defects = -1
         tail_logs: List[str] = []
         if proc.stdout is None:
             raise RuntimeError('failed to read video script stdout')
@@ -454,8 +506,8 @@ class InferenceService:
             if not line:
                 continue
             tail_logs.append(line)
-            if len(tail_logs) > 80:
-                tail_logs = tail_logs[-80:]
+            if len(tail_logs) > 100:
+                tail_logs = tail_logs[-100:]
 
             info_match = re.search(r'processed=(\d+)', line)
             if info_match:
@@ -468,21 +520,24 @@ class InferenceService:
                 progress_cb(progress, 'infer_video', line)
                 continue
 
-            done_frames_match = re.search(r'^\[DONE\]\s+frames\s*=\s*(\d+)', line)
+            done_frames_match = re.search(r'^\[DONE\]\s+source_frames\s*=\s*(\d+)', line)
             if done_frames_match:
                 processed_frames = int(done_frames_match.group(1))
                 progress_cb(95, 'video_done', line)
+                continue
+
+            dedup_match = re.search(r'^\[DONE\]\s+dedup_defects\s*=\s*(\d+)', line)
+            if dedup_match:
+                dedup_defects = int(dedup_match.group(1))
+                progress_cb(96, 'video_dedup', line)
                 continue
 
             progress_cb(15, 'video_log', line)
 
         return_code = proc.wait()
         if return_code != 0:
-            joined = '\n'.join(tail_logs[-20:])
-            raise RuntimeError(
-                f'video_infer_piping.py failed with code {return_code}\n'
-                f'last logs:\n{joined}'
-            )
+            joined = '\n'.join(tail_logs[-25:])
+            raise RuntimeError(f'video_infer_piping.py failed with code {return_code}\nlast logs:\n{joined}')
 
         records: List[Dict[str, Any]] = []
         if output_jsonl.exists():
@@ -496,13 +551,22 @@ class InferenceService:
                             records.append(json.loads(line))
                         except json.JSONDecodeError:
                             continue
-
-            # jsonl contains inferenced frames only.
             try:
                 with open(output_jsonl, 'r', encoding='utf-8') as f_jsonl:
                     inferenced_frames = sum(1 for _ in f_jsonl)
             except Exception:
                 inferenced_frames = -1
+
+        defect_records: List[Dict[str, Any]] = []
+        if output_defects_json.exists():
+            try:
+                with open(output_defects_json, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    defect_records = loaded.get('items', []) if isinstance(loaded, dict) else []
+                    if dedup_defects < 0:
+                        dedup_defects = len(defect_records)
+            except Exception:
+                defect_records = []
 
         progress_cb(98, 'finalizing', 'video inference finished, preparing response')
         return {
@@ -511,60 +575,65 @@ class InferenceService:
             'total_frames': total_frames,
             'processed_frames': processed_frames,
             'inferenced_frames': inferenced_frames,
+            'dedup_defects': dedup_defects,
             'requested_infer_stride': max(infer_stride, 1),
+            'requested_vis_stride': max(vis_stride, 1),
+            'requested_write_stride': max(write_stride, 1),
             'output_video': str(output_video),
             'output_jsonl': str(output_jsonl),
+            'output_defects_json': str(output_defects_json),
+            'output_frame_index_json': str(output_frame_index_json),
+            'output_defect_images_dir': str(output_defect_frames_dir),
+            'output_defect_frames_dir': str(output_defect_frames_dir),
+            'output_defect_crops_dir': str(output_defect_crops_dir),
             'records': records,
+            'defects': defect_records if return_records else [],
             'engine': 'video_infer_piping.py',
         }
 
-    def process_request(
-        self,
-        request: Dict[str, Any],
-        progress_cb: Callable[[int, str, str], None],
-    ) -> Dict[str, Any]:
+    def process_request(self, request: Dict[str, Any], progress_cb: Callable[[int, str, str], None]) -> Dict[str, Any]:
         file_path = str(request.get('file_path', '')).strip()
         if not file_path:
             raise ValueError('`file_path` is required')
 
         task_id = str(request.get('task_id', '')).strip() or uuid.uuid4().hex
         base_dir = Path(request.get('base_dir', REPO_ROOT))
-        input_path = self._resolve_request_path(
-            file_path,
-            base_dir=base_dir,
-            field_name='file_path',
-            must_exist=True,
-        )
+        input_path = self._resolve_request_path(file_path, base_dir=base_dir, field_name='file_path', must_exist=True)
 
         config_value = str(request.get('config', '')).strip() or self.default_config
         checkpoint_value = str(request.get('checkpoint', '')).strip() or self.default_checkpoint
         device = str(request.get('device', '')).strip() or self.default_device
         score_thr = float(request.get('score_thr', self.default_score_thr))
         out_dir_value = str(request.get('out_dir', '')).strip() or self.default_out_dir
+
         infer_stride = int(request.get('infer_stride', self.default_infer_stride))
+        vis_stride = int(request.get('vis_stride', self.default_vis_stride))
+        write_stride = int(request.get('write_stride', self.default_write_stride))
+        resize_width = int(request.get('resize_width', self.default_resize_width))
+        resize_height = int(request.get('resize_height', self.default_resize_height))
+        vis_score_thr = float(request.get('vis_score_thr', self.default_vis_score_thr))
+        vis_topk = int(request.get('vis_topk', self.default_vis_topk))
+
+        match_iou_thr = float(request.get('match_iou_thr', self.default_match_iou_thr))
+        match_center_dist_ratio = float(request.get('match_center_dist_ratio', self.default_match_center_dist_ratio))
+        max_frame_gap = int(request.get('max_frame_gap', self.default_max_frame_gap))
+        post_merge_gap_frames = int(request.get('post_merge_gap_frames', self.default_post_merge_gap_frames))
+        post_merge_iou_thr = float(request.get('post_merge_iou_thr', self.default_post_merge_iou_thr))
+        chain_gap_frames = int(request.get('chain_gap_frames', self.default_chain_gap_frames))
+        chain_iou_thr = float(request.get('chain_iou_thr', self.default_chain_iou_thr))
+        chain_center_dist_ratio = float(request.get('chain_center_dist_ratio', self.default_chain_center_dist_ratio))
+        chain_max_keep = int(request.get('chain_max_keep', self.default_chain_max_keep))
+        min_hits = int(request.get('min_hits', self.default_min_hits))
+        single_hit_high_score = float(request.get('single_hit_high_score', self.default_single_hit_high_score))
+
         max_frames = int(request.get('max_frames', self.default_max_frames))
         progress_every_frames = int(request.get('progress_every_frames', self.default_progress_every))
         save_visualization = bool(request.get('save_visualization', False))
         return_records = bool(request.get('return_records', False))
 
-        config_path = self._resolve_request_path(
-            config_value,
-            base_dir=REPO_ROOT,
-            field_name='config',
-            must_exist=True,
-        )
-        checkpoint_path = self._resolve_request_path(
-            checkpoint_value,
-            base_dir=REPO_ROOT,
-            field_name='checkpoint',
-            must_exist=True,
-        )
-        out_dir = self._resolve_request_path(
-            out_dir_value,
-            base_dir=REPO_ROOT,
-            field_name='out_dir',
-            must_exist=False,
-        )
+        config_path = self._resolve_request_path(config_value, base_dir=REPO_ROOT, field_name='config', must_exist=True)
+        checkpoint_path = self._resolve_request_path(checkpoint_value, base_dir=REPO_ROOT, field_name='checkpoint', must_exist=True)
+        out_dir = self._resolve_request_path(out_dir_value, base_dir=REPO_ROOT, field_name='out_dir', must_exist=False)
         mkdir_or_exist(str(out_dir))
 
         progress_cb(2, 'request_received', f'task_id={task_id}')
@@ -581,6 +650,23 @@ class InferenceService:
                 score_thr=score_thr,
                 out_dir=out_dir,
                 infer_stride=infer_stride,
+                vis_stride=vis_stride,
+                write_stride=write_stride,
+                resize_width=resize_width,
+                resize_height=resize_height,
+                vis_score_thr=vis_score_thr,
+                vis_topk=vis_topk,
+                match_iou_thr=match_iou_thr,
+                match_center_dist_ratio=match_center_dist_ratio,
+                max_frame_gap=max_frame_gap,
+                post_merge_gap_frames=post_merge_gap_frames,
+                post_merge_iou_thr=post_merge_iou_thr,
+                chain_gap_frames=chain_gap_frames,
+                chain_iou_thr=chain_iou_thr,
+                chain_center_dist_ratio=chain_center_dist_ratio,
+                chain_max_keep=chain_max_keep,
+                min_hits=min_hits,
+                single_hit_high_score=single_hit_high_score,
                 max_frames=max_frames,
                 progress_every_frames=progress_every_frames,
                 return_records=return_records,
@@ -625,7 +711,6 @@ class InferenceRequestHandler(socketserver.StreamRequestHandler):
 
     def handle(self) -> None:
         service: InferenceService = self.server.inference_service  # type: ignore[attr-defined]
-
         line = self.rfile.readline()
         if not line:
             return
@@ -634,20 +719,12 @@ class InferenceRequestHandler(socketserver.StreamRequestHandler):
             if not isinstance(request, dict):
                 raise ValueError('request body must be a JSON object')
         except Exception as exc:
-            self._send_json({
-                'type': 'error',
-                'status': 'error',
-                'message': f'invalid request json: {exc}',
-            })
+            self._send_json({'type': 'error', 'status': 'error', 'message': f'invalid request json: {exc}'})
             return
 
         task_id = str(request.get('task_id', '')).strip() or uuid.uuid4().hex
         request['task_id'] = task_id
-        self._send_json({
-            'type': 'ack',
-            'status': 'accepted',
-            'task_id': task_id,
-        })
+        self._send_json({'type': 'ack', 'status': 'accepted', 'task_id': task_id})
 
         def progress_cb(progress: int, stage: str, message: str) -> None:
             self._send_json({
@@ -661,12 +738,7 @@ class InferenceRequestHandler(socketserver.StreamRequestHandler):
 
         try:
             result = service.process_request(request, progress_cb)
-            self._send_json({
-                'type': 'result',
-                'status': 'ok',
-                'task_id': task_id,
-                'result': result,
-            })
+            self._send_json({'type': 'result', 'status': 'ok', 'task_id': task_id, 'result': result})
         except Exception as exc:
             self._send_json({
                 'type': 'error',
@@ -681,56 +753,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='TCP server for piping inference')
     parser.add_argument('--host', default=os.getenv('TCP_HOST', '0.0.0.0'), help='TCP bind host')
     parser.add_argument('--port', type=int, default=int(os.getenv('TCP_PORT', '9000')), help='TCP bind port')
-    parser.add_argument(
-        '--default-config',
-        default=os.getenv('MODEL_CONFIG', str(REPO_ROOT / 'projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py')),
-        help='default config path if not provided in request',
-    )
-    parser.add_argument(
-        '--default-checkpoint',
-        default=os.getenv('MODEL_CHECKPOINT', str(REPO_ROOT / 'weights/best_coco_破裂_precision_epoch_25.pth')),
-        help='default checkpoint path if not provided in request',
-    )
-    parser.add_argument(
-        '--default-device',
-        default=os.getenv('MODEL_DEVICE', 'cuda:0'),
-        help='default inference device if not provided in request',
-    )
-    parser.add_argument(
-        '--default-score-thr',
-        type=float,
-        default=float(os.getenv('SCORE_THR', '0.3')),
-        help='default score threshold if not provided in request',
-    )
-    parser.add_argument(
-        '--default-out-dir',
-        default=os.getenv('OUTPUT_DIR', str(REPO_ROOT / 'output/tcp_results')),
-        help='default output directory for jsonl and visualization',
-    )
-    parser.add_argument(
-        '--default-infer-stride',
-        type=int,
-        default=int(os.getenv('INFER_STRIDE', '3')),
-        help='default infer stride for video',
-    )
-    parser.add_argument(
-        '--default-max-frames',
-        type=int,
-        default=int(os.getenv('MAX_FRAMES', '-1')),
-        help='default max frames for video, -1 means all',
-    )
-    parser.add_argument(
-        '--default-progress-every',
-        type=int,
-        default=int(os.getenv('PROGRESS_EVERY_FRAMES', '30')),
-        help='default progress interval for video frames',
-    )
-    parser.add_argument(
-        '--path-mappings',
-        default=os.getenv('PATH_MAPPINGS', ''),
-        help='windows->container path mappings: '
-             '"C:\\\\host\\\\data=/data/input;D:\\\\videos=/data/videos" or JSON object string',
-    )
+    parser.add_argument('--default-config', default=os.getenv('MODEL_CONFIG', str(REPO_ROOT / 'projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py')), help='default config path if not provided in request')
+    parser.add_argument('--default-checkpoint', default=os.getenv('MODEL_CHECKPOINT', str(REPO_ROOT / 'weights/best_coco_破裂_precision_epoch_25.pth')), help='default checkpoint path if not provided in request')
+    parser.add_argument('--default-device', default=os.getenv('MODEL_DEVICE', 'cuda:0'), help='default inference device if not provided in request')
+    parser.add_argument('--default-score-thr', type=float, default=float(os.getenv('SCORE_THR', '0.3')), help='default score threshold if not provided in request')
+    parser.add_argument('--default-out-dir', default=os.getenv('OUTPUT_DIR', str(REPO_ROOT / 'output/tcp_results')), help='default output directory for jsonl and visualization')
+
+    parser.add_argument('--default-infer-stride', type=int, default=int(os.getenv('INFER_STRIDE', '3')), help='default infer stride for video')
+    parser.add_argument('--default-vis-stride', type=int, default=int(os.getenv('VIS_STRIDE', '3')), help='default vis stride for video')
+    parser.add_argument('--default-write-stride', type=int, default=int(os.getenv('WRITE_STRIDE', '3')), help='default write stride for video')
+    parser.add_argument('--default-resize-width', type=int, default=int(os.getenv('RESIZE_WIDTH', '1280')), help='default resize width for video')
+    parser.add_argument('--default-resize-height', type=int, default=int(os.getenv('RESIZE_HEIGHT', '720')), help='default resize height for video')
+    parser.add_argument('--default-vis-score-thr', type=float, default=float(os.getenv('VIS_SCORE_THR', '0.18')), help='default visualization score threshold for video')
+    parser.add_argument('--default-vis-topk', type=int, default=int(os.getenv('VIS_TOPK', '10')), help='default visualization topk for video')
+
+    parser.add_argument('--default-match-iou-thr', type=float, default=float(os.getenv('MATCH_IOU_THR', '0.35')), help='default cross-frame match IoU threshold')
+    parser.add_argument('--default-match-center-dist-ratio', type=float, default=float(os.getenv('MATCH_CENTER_DIST_RATIO', '0.22')), help='default normalized center distance threshold')
+    parser.add_argument('--default-max-frame-gap', type=int, default=int(os.getenv('MAX_FRAME_GAP', '9')), help='default max frame gap for a track')
+    parser.add_argument('--default-post-merge-gap-frames', type=int, default=int(os.getenv('POST_MERGE_GAP_FRAMES', '9')), help='default second-pass merge frame gap')
+    parser.add_argument('--default-post-merge-iou-thr', type=float, default=float(os.getenv('POST_MERGE_IOU_THR', '0.30')), help='default second-pass merge IoU threshold')
+    parser.add_argument('--default-chain-gap-frames', type=int, default=int(os.getenv('CHAIN_GAP_FRAMES', '18')), help='default defect-chain merge frame gap')
+    parser.add_argument('--default-chain-iou-thr', type=float, default=float(os.getenv('CHAIN_IOU_THR', '0.18')), help='default defect-chain merge IoU threshold')
+    parser.add_argument('--default-chain-center-dist-ratio', type=float, default=float(os.getenv('CHAIN_CENTER_DIST_RATIO', '0.28')), help='default defect-chain normalized center distance threshold')
+    parser.add_argument('--default-chain-max-keep', type=int, default=int(os.getenv('CHAIN_MAX_KEEP', '1')), help='default max kept samples for one repeated defect chain')
+    parser.add_argument('--default-min-hits', type=int, default=int(os.getenv('MIN_HITS', '2')), help='default min hits to keep a defect')
+    parser.add_argument('--default-single-hit-high-score', type=float, default=float(os.getenv('SINGLE_HIT_HIGH_SCORE', '0.45')), help='default score threshold to keep a single-hit defect')
+
+    parser.add_argument('--default-max-frames', type=int, default=int(os.getenv('MAX_FRAMES', '-1')), help='default max frames for video, -1 means all')
+    parser.add_argument('--default-progress-every', type=int, default=int(os.getenv('PROGRESS_EVERY_FRAMES', '30')), help='default progress interval for video frames')
+    parser.add_argument('--path-mappings', default=os.getenv('PATH_MAPPINGS', ''), help='windows->container path mappings: "C:\\\\host\\\\data=/data/input;D:\\\\videos=/data/videos" or JSON object string')
     return parser.parse_args()
 
 
@@ -745,6 +796,23 @@ def main() -> None:
         default_score_thr=args.default_score_thr,
         default_out_dir=args.default_out_dir,
         default_infer_stride=args.default_infer_stride,
+        default_vis_stride=args.default_vis_stride,
+        default_write_stride=args.default_write_stride,
+        default_resize_width=args.default_resize_width,
+        default_resize_height=args.default_resize_height,
+        default_vis_score_thr=args.default_vis_score_thr,
+        default_vis_topk=args.default_vis_topk,
+        default_match_iou_thr=args.default_match_iou_thr,
+        default_match_center_dist_ratio=args.default_match_center_dist_ratio,
+        default_max_frame_gap=args.default_max_frame_gap,
+        default_post_merge_gap_frames=args.default_post_merge_gap_frames,
+        default_post_merge_iou_thr=args.default_post_merge_iou_thr,
+        default_chain_gap_frames=args.default_chain_gap_frames,
+        default_chain_iou_thr=args.default_chain_iou_thr,
+        default_chain_center_dist_ratio=args.default_chain_center_dist_ratio,
+        default_chain_max_keep=args.default_chain_max_keep,
+        default_min_hits=args.default_min_hits,
+        default_single_hit_high_score=args.default_single_hit_high_score,
         default_max_frames=args.default_max_frames,
         default_progress_every=args.default_progress_every,
         path_mappings=path_mappings,
@@ -756,6 +824,11 @@ def main() -> None:
         print(f'[TCP] default config     : {args.default_config}')
         print(f'[TCP] default checkpoint : {args.default_checkpoint}')
         print(f'[TCP] default device     : {args.default_device}')
+        print(f'[TCP] default out_dir    : {args.default_out_dir}')
+        print(f'[TCP] default infer/vis/write stride : {args.default_infer_stride}/{args.default_vis_stride}/{args.default_write_stride}')
+        print(f'[TCP] default resize     : {args.default_resize_width}x{args.default_resize_height}')
+        print(f'[TCP] default dedup      : iou={args.default_match_iou_thr}, center_ratio={args.default_match_center_dist_ratio}, max_gap={args.default_max_frame_gap}, min_hits={args.default_min_hits}')
+        print(f'[TCP] default chain merge: gap={args.default_chain_gap_frames}, iou={args.default_chain_iou_thr}, center_ratio={args.default_chain_center_dist_ratio}, max_keep={args.default_chain_max_keep}')
         if path_mappings:
             print('[TCP] path mappings:')
             for host_path, container_path in path_mappings:

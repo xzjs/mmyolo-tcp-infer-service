@@ -3,11 +3,7 @@ _base_ = './defects_detection_v3/yolov8_s_fast_8xb16-500e_base.py'
 
 # load_from = 'https://download.openmmlab.com/mmyolo/v0/yolov8/yolov8_n_syncbn_fast_8xb16-500e_coco/yolov8_n_syncbn_fast_8xb16-500e_coco_20230114_131804-88c11cdb.pth'
 # load_from = '/home/zhuangwj/mmyolo/work_dir_n_freeze4_withoutlj/epoch_155.pth'
-# load_from = '/home/zhuangwj/mmyolo/work_dir_n_freeze_stage4_adam_v2_close_mosaic/best_coco_破裂_precision_epoch_180.pth'
-
-# load_from = '/root/piping_autodl_bundle/piping_autodl_bundle/mmyolo/weights/yolov8_n_syncbn_fast_8xb16-500e_coco_20230114_131804-88c11cdb.pth'
-load_from = '/root/piping_autodl_bundle/piping_autodl_bundle/mmyolo/weights/best_coco_破裂_precision_epoch_55.pth'
-
+load_from = '/home/zhuangwj/mmyolo/work_dir_n_freeze_stage4_adam_v2_close_mosaic/best_coco_破裂_precision_epoch_180.pth'
 
 deepen_factor = 0.33
 widen_factor = 0.25
