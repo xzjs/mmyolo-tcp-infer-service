@@ -1,5 +1,3 @@
-﻿version: "3.9"
-
 services:
   mmyolo-tcp-infer:
     image: registry.cn-hangzhou.aliyuncs.com/xzjs/mmyolo-tcp-infer:1.5

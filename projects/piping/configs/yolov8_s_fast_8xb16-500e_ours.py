@@ -1,5 +1,5 @@
 # custom_imports = dict(imports=['mmyolo.datasets.piping_dataset'], allow_failed_imports=False)
-_base_ = ['../_base_/default_runtime.py', '../_base_/det_p5_tta.py']
+_base_ = ['./_base_/default_runtime.py', './_base_/det_p5_tta.py']
 
 load_from = 'https://download.openmmlab.com/mmyolo/v0/yolov8/yolov8_n_mask-refine_syncbn_fast_8xb16-500e_coco/yolov8_n_mask-refine_syncbn_fast_8xb16-500e_coco_20230216_101206-b975b1cd.pth'
 # load_from = 'https://download.openmmlab.com/mmyolo/v0/yolov8/yolov8_s_syncbn_fast_8xb16-500e_coco/yolov8_s_syncbn_fast_8xb16-500e_coco_20230117_180101-5aa5f0f1.pth'  # noqa
