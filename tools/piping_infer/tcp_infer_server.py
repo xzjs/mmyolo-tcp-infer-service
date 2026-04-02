@@ -19,6 +19,7 @@
 """
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -33,8 +34,42 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mmcv
-from mmdet.apis import inference_detector, init_detector
+import torch
 from mmengine.utils import mkdir_or_exist
+
+
+def enable_legacy_checkpoint_loading() -> None:
+    """兼容 PyTorch 2.6+ 默认 weights_only=True 导致的旧权重加载失败。"""
+    if getattr(torch, '_mmyolo_torch_load_patched', False):
+        return
+
+    try:
+        has_weights_only = 'weights_only' in inspect.signature(torch.load).parameters
+    except Exception:
+        has_weights_only = False
+
+    original_torch_load = torch.load
+
+    def _torch_load_compat(*args, **kwargs):
+        if has_weights_only and 'weights_only' not in kwargs:
+            kwargs['weights_only'] = False
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = _torch_load_compat
+    torch._mmyolo_torch_load_patched = True
+
+    # 兼容部分旧 checkpoint 中的历史缓冲对象。
+    try:
+        add_safe_globals = getattr(torch.serialization, 'add_safe_globals', None)
+        if callable(add_safe_globals):
+            from mmengine.logging.history_buffer import HistoryBuffer
+            add_safe_globals([HistoryBuffer])
+    except Exception:
+        pass
+
+
+enable_legacy_checkpoint_loading()
+from mmdet.apis import inference_detector, init_detector
 
 THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = THIS_FILE.parents[2]
