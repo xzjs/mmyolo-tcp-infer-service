@@ -1,6 +1,6 @@
-services:
+﻿services:
   mmyolo-tcp-infer:
-    image: registry.cn-hangzhou.aliyuncs.com/xzjs/mmyolo-tcp-infer:1.5
+    image: registry.cn-hangzhou.aliyuncs.com/xzjs/mmyolo-tcp-infer:1.8
     container_name: mmyolo-tcp-infer
     restart: unless-stopped
     gpus: all
@@ -10,7 +10,7 @@ services:
       TCP_HOST: "0.0.0.0"
       TCP_PORT: "9000"
       MODEL_CONFIG: "/workspace/mmyolo/projects/piping/configs/yolov8_s_fast_8xb16-500e_ours.py"
-      MODEL_CHECKPOINT: "/workspace/mmyolo/weights/best_coco_鐮磋_precision_epoch_25.pth"
+      MODEL_CHECKPOINT: "/workspace/mmyolo/weights/best_coco_閻顥嘷precision_epoch_25.pth"
       MODEL_DEVICE: "cuda:0"
       SCORE_THR: "0.3"
       OUTPUT_DIR: "/workspace/mmyolo/output/tcp_results"
@@ -24,4 +24,5 @@ services:
       - ${LOCAL_INPUT_DIR:-D:/piping/input}:/data/local_input
     command: >
       python tools/piping_infer/tcp_infer_server.py --host 0.0.0.0 --port 9000
+
 

@@ -7,6 +7,7 @@ param(
     [bool]$Push = $true,
     [bool]$AlsoLatest = $false,
     [bool]$UpdateCompose = $true,
+    [string[]]$BuildArgs = @(),
     [string[]]$ComposeFiles = @(
         "deploy/docker-compose.tcp-infer.runtime.yaml",
         "partner_delivery/docker-compose.tcp-infer.runtime.yaml"
@@ -122,9 +123,18 @@ Write-Host "Dockerfile : $Dockerfile"
 Write-Host "Context    : $ContextDir"
 Write-Host "Push       : $Push"
 Write-Host "AlsoLatest : $AlsoLatest"
+Write-Host "BuildArgs  : $($BuildArgs -join ',')"
 Write-Host "=================================================="
 
-Invoke-Docker -Args @("build", "-f", $Dockerfile, "-t", $fullImageTag, $ContextDir)
+$dockerBuildArgs = @("build", "-f", $Dockerfile, "-t", $fullImageTag)
+foreach ($arg in $BuildArgs) {
+    if (-not [string]::IsNullOrWhiteSpace($arg)) {
+        $dockerBuildArgs += @("--build-arg", $arg)
+    }
+}
+$dockerBuildArgs += $ContextDir
+
+Invoke-Docker -Args $dockerBuildArgs
 
 if ($Push) {
     Invoke-Docker -Args @("push", $fullImageTag)

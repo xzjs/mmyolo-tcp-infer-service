@@ -1,29 +1,44 @@
-ARG BASE_IMAGE="pytorch/pytorch:1.9.0-cuda11.1-cudnn8-devel"
+ARG BASE_IMAGE="pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel"
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     FORCE_CUDA=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    MMCV_WITH_OPS=1 \
+    TORCH_CUDA_ARCH_LIST="12.0+PTX" \
+    MAX_JOBS=2 \
+    CMAKE_BUILD_PARALLEL_LEVEL=2 \
+    CUDA_HOME=/usr/local/cuda
 
-RUN rm -f /etc/apt/sources.list.d/cuda.list \
-    && rm -f /etc/apt/sources.list.d/nvidia-ml.list \
-    && apt-key del 7fa2af80 || true \
-    && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub \
-    && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1804/x86_64/7fa2af80.pub
+ARG TORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/cu128"
+ARG TORCH_PRE=1
+ARG REINSTALL_TORCH=0
+ARG TORCH_VERSION=""
+ARG TORCHVISION_VERSION=""
+ARG TORCHAUDIO_VERSION=""
 
 RUN set -eux; \
-    sed -i '/bionic-backports/d' /etc/apt/sources.list; \
-    sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
-    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list || true; \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list || true; \
     printf 'Acquire::Retries "8";\nAcquire::http::Timeout "60";\nAcquire::http::Pipeline-Depth "0";\n' > /etc/apt/apt.conf.d/80-retries; \
     apt-get update; \
-    apt-get install -y --no-install-recommends --fix-missing ffmpeg libsm6 libxext6 git ninja-build libglib2.0-0 libxrender-dev fontconfig fonts-wqy-zenhei fonts-noto-cjk \
+    apt-get install -y --no-install-recommends --fix-missing \
+        python3 python3-pip python3-dev \
+        build-essential cmake git ninja-build \
+        ffmpeg libsm6 libxext6 libglib2.0-0 libxrender-dev libgl1 \
+        fontconfig fonts-wqy-zenhei fonts-noto-cjk \
     || (apt-get clean \
         && rm -rf /var/lib/apt/lists/* \
         && sed -i 's|http://mirrors.aliyun.com/ubuntu|http://mirrors.ustc.edu.cn/ubuntu|g' /etc/apt/sources.list \
         && apt-get update \
-        && apt-get install -y --no-install-recommends --fix-missing ffmpeg libsm6 libxext6 git ninja-build libglib2.0-0 libxrender-dev fontconfig fonts-wqy-zenhei fonts-noto-cjk); \
+        && apt-get install -y --no-install-recommends --fix-missing \
+            python3 python3-pip python3-dev \
+            build-essential cmake git ninja-build \
+            ffmpeg libsm6 libxext6 libglib2.0-0 libxrender-dev libgl1 \
+            fontconfig fonts-wqy-zenhei fonts-noto-cjk); \
+    ln -sf /usr/bin/python3 /usr/bin/python; \
+    ln -sf /usr/bin/pip3 /usr/bin/pip; \
     fc-cache -fv; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
@@ -31,11 +46,64 @@ RUN set -eux; \
 WORKDIR /workspace/mmyolo
 COPY . /workspace/mmyolo
 
-RUN pip install openmim \
-    && mim install "mmengine>=0.6.0" "mmcv>=2.0.0rc4,<2.1.0" "mmdet>=3.0.0,<4.0.0" \
-    && pip install -r requirements/runtime.txt \
-    && pip install pillow \
-    && pip install -e .
+RUN set -eux; \
+    python -m pip install --upgrade pip "setuptools<70" wheel ninja; \
+    python -m pip install "numpy<2" "cython<3" packaging; \
+    if [ "${REINSTALL_TORCH}" = "1" ]; then \
+        if [ -n "${TORCH_VERSION}" ]; then \
+            python -m pip install --index-url "${TORCH_INDEX_URL}" \
+                "torch==${TORCH_VERSION}" \
+                "torchvision==${TORCHVISION_VERSION}" \
+                "torchaudio==${TORCHAUDIO_VERSION}"; \
+        elif [ "${TORCH_PRE}" = "1" ]; then \
+            python -m pip install --pre --index-url "${TORCH_INDEX_URL}" torch torchvision torchaudio; \
+        else \
+            python -m pip install --index-url "${TORCH_INDEX_URL}" torch torchvision torchaudio; \
+        fi; \
+    else \
+        python -c "import torch; print('use base torch:', torch.__version__); print('use base torch cuda:', torch.version.cuda)"; \
+    fi
+
+RUN set -eux; \
+    python -m pip install openmim; \
+    python -m pip install "mmengine>=0.7.1,<1.0.0"; \
+    python -m pip uninstall -y mmcv mmcv-lite || true; \
+    (mim install "mmcv==2.1.0" \
+      || python -m pip install --no-build-isolation --no-binary mmcv -v "mmcv==2.1.0"); \
+    python -m pip install "mmdet>=3.0.0,<3.4.0"; \
+    python -m pip install -r requirements/runtime.txt; \
+    python -m pip install pillow; \
+    python -m pip install -e . --no-build-isolation --no-use-pep517 \
+      || python setup.py develop
+
+RUN python - <<'PY'
+import mmcv
+import mmcv._ext
+print("mmcv:", mmcv.__version__)
+print("mmcv._ext ok")
+PY
+
+RUN python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+PY
+
+RUN python - <<'PY'
+import matplotlib
+import mmcv
+import mmcv._ext
+import mmdet
+import pycocotools
+import scipy
+import shapely
+import six
+import terminaltables
+import tqdm
+print("dependency check ok")
+print("mmdet:", mmdet.__version__)
+PY
 
 ENV PYTHONPATH="/workspace/mmyolo:/workspace/mmyolo/projects/piping/src:${PYTHONPATH}" \
     TCP_HOST=0.0.0.0 \

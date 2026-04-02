@@ -1,3 +1,10 @@
+matplotlib
 numpy
-prettytable
 Pillow
+prettytable
+pycocotools
+scipy
+shapely
+six
+terminaltables
+tqdm
